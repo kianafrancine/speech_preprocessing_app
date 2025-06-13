@@ -1,0 +1,131 @@
+import streamlit as st
+from streamlit_webrtc import webrtc_streamer, AudioProcessorBase
+import av
+import numpy as np
+import soundfile as sf
+import librosa
+import librosa.display
+import matplotlib.pyplot as plt
+import noisereduce as nr
+from scipy.signal import butter, lfilter
+from io import BytesIO
+
+# --- DSP Helper Functions ---
+
+def normalize_audio(audio):
+    max_val = np.max(np.abs(audio))
+    return audio if max_val == 0 else audio / max_val * 0.9
+
+def reduce_noise(audio, sr):
+    return nr.reduce_noise(y=audio, sr=sr)
+
+def bandpass_filter(audio, sr=16000, lowcut=500.0, highcut=2800.0):
+    nyq = 0.5 * sr
+    low = lowcut / nyq
+    high = highcut / nyq
+    b, a = butter(6, [low, high], btype='band')
+    return lfilter(b, a, audio)
+
+def amplify_audio(audio, gain=2.0):
+    return np.clip(audio * gain, -1.0, 1.0)
+
+def plot_waveform(audio, sr, title):
+    fig, ax = plt.subplots()
+    t = np.linspace(0, len(audio) / sr, len(audio))
+    ax.plot(t, audio)
+    ax.set_title(title)
+    ax.set_xlabel("Time (s)")
+    ax.set_ylabel("Amplitude")
+    st.pyplot(fig)
+
+# --- Audio Processor for Microphone ---
+
+class AudioProcessor(AudioProcessorBase):
+    def __init__(self):
+        self.frames = []
+
+    def recv(self, frame: av.AudioFrame) -> av.AudioFrame:
+        audio = frame.to_ndarray().flatten().astype(np.float32) / 32768.0  # Normalize int16 to float32
+        self.frames.append(audio)
+        return frame
+
+# --- Page Control Logic ---
+
+if 'page' not in st.session_state:
+    st.session_state.page = 'welcome'
+
+def go_to(page):
+    st.session_state.page = page
+
+# --- Welcome Page ---
+
+if st.session_state.page == 'welcome':
+    st.title("🎤 Speech Preprocessing Web App")
+    st.write("Welcome! This tool allows you to record or upload speech and view both original and cleaned versions.")
+    st.button("Get Started", on_click=lambda: go_to("select"))
+
+# --- Selection Page ---
+
+elif st.session_state.page == 'select':
+    st.title("🔍 Select Input Method")
+    method = st.radio("Choose input method:", ["🎙 Record via Microphone", "📁 Upload WAV File"])
+
+    if method == "📁 Upload WAV File":
+        uploaded = st.file_uploader("Upload a WAV file", type=["wav"])
+        if uploaded:
+            y, sr = librosa.load(uploaded, sr=16000, mono=True)
+            st.session_state.original_audio = y
+            st.session_state.sr = sr
+            go_to("result")
+
+    elif method == "🎙 Record via Microphone":
+        st.info("Start recording and speak for up to 10 seconds. Then click 'Process'.")
+        ctx = webrtc_streamer(
+            key="mic",
+            audio_processor_factory=AudioProcessor,
+            media_stream_constraints={"audio": True, "video": False},
+            async_processing=True,
+        )
+
+        if st.button("✅ Process Mic Recording"):
+            if ctx and ctx.state.playing and ctx.audio_processor:
+                audio = np.concatenate(ctx.audio_processor.frames)
+                if len(audio) < 16000 * 2:
+                    st.warning("Please record at least 2 seconds.")
+                else:
+                    y = audio[-16000 * 10:]  # Last 10 seconds
+                    st.session_state.original_audio = y
+                    st.session_state.sr = 16000
+                    go_to("result")
+            else:
+                st.warning("No audio data found. Make sure you're recording.")
+
+# --- Result Page ---
+
+elif st.session_state.page == 'result':
+    st.title("📊 Audio Processing Results")
+
+    y = st.session_state.original_audio
+    sr = st.session_state.sr
+
+    st.subheader("🔊 Original Audio")
+    buf_orig = BytesIO()
+    sf.write(buf_orig, y, sr, format='wav')
+    st.audio(buf_orig)
+    plot_waveform(y, sr, "Original Waveform")
+
+    # Preprocessing
+    audio_clean = normalize_audio(y)
+    audio_clean = reduce_noise(audio_clean, sr)
+    audio_clean = bandpass_filter(audio_clean, sr)
+    audio_clean = amplify_audio(audio_clean)
+    audio_clean = normalize_audio(audio_clean)
+
+    st.subheader("🧼 Cleaned Audio")
+    buf_clean = BytesIO()
+    sf.write(buf_clean, audio_clean, sr, format='wav')
+    st.audio(buf_clean)
+    plot_waveform(audio_clean, sr, "Cleaned Waveform")
+
+    st.download_button("⬇️ Download Cleaned Audio", buf_clean.getvalue(), "cleaned_audio.wav", mime="audio/wav")
+    st.button("🔙 Back to Start", on_click=lambda: go_to("welcome"))
