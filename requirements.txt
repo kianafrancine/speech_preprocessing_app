@@ -1,0 +1,9 @@
+streamlit
+streamlit-webrtc
+numpy
+librosa
+matplotlib
+soundfile
+noisereduce
+scipy
+av
